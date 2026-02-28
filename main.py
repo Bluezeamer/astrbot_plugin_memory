@@ -80,21 +80,37 @@ _MEMO_GUIDE = """
 
 ## 备忘录使用指南
 以上备忘录内容为用户的跨会话待办事项，已内化为你的既有认知。
-备忘录条目 ID 格式为分钟级时间戳（如 202602281310 表示 2026-02-28 13:10 创建），可据此判断事项的时间先后。
-在以下情况主动提及：
-- 用户问"我还有什么没做" / "接下来做什么" / "帮我看看计划"时，根据备忘录内容组织回答
+备忘录采用 block 结构，每个 block 有唯一 ID（分钟级时间戳，如 202602281310 表示 2026-02-28 13:10 创建）。
+block 内部自由组织，可以是单条待办、一组相关任务、或含讨论细节的复合事项。
+这些 block ID 仅用于工具调用定位，不属于向用户展示的信息。
+
+输出规范：
+- 向用户提及备忘事项时，只呈现内容本身，不输出 block ID 和时间戳
+- 除非用户明确询问创建时间，才用自然语言说明（如"这条是昨天下午记的"）
+- block 内有详细讨论内容时，根据上下文自然融入回答
+
+触发场景：
+- 用户问"我还有什么没做" / "接下来做什么" / "帮我看看计划"时，用自然语言组织回答
 - 对话开始时有未完成事项，可简短提示一次
 - 用户提到某件事"之后再做" / "有空再说"时，询问是否记入备忘录
-- 用户一次提到多件待办事项时，使用 create_memo 批量记入
-用户明确完成某事后，调用 delete_memo 删除对应条目。
+- 用户一次提到多件待办时，使用 add_memo_block 批量记入，相关事项可归入同一 block
+- 用户就某条备忘展开讨论时，将讨论结果通过 write_memo_block 补充到对应 block
+- 需要整理合并备忘时：add_memo_block 新建合并后的 block，再 delete_memo_block 删除被合并的旧 block
+用户明确完成某事后，调用 delete_memo_block 删除对应 block。
+- 如果备忘录已有相似项，向用户确认是否需要记录
+- 对于一次写入多个待做事项，优先按照block分类，以获得良好的组织结构
 """
 
 _TODO_GUIDE = """
 
 ## TODO 自主管理
 你拥有会话级 TODO 能力，用于自我规划复杂任务的执行进度。
+注意，这仅用于辅助你自己记忆推理。因此当用户希望你帮忙记住某些待做事情时，不应该使用TODO，而应该使用备忘录。
 
-触发条件（满足任一即应主动创建 TODO）：
+触发条件：
+> 必须满足
+- 当前会话需要立即完成的任务
+> 同时, 至少满足以下一项
 - 用户一次提出多个问题或需求
 - 任务涉及多个步骤或阶段
 - 预计需要多轮对话才能完成
@@ -146,6 +162,22 @@ def _write(path: str, content: str):
 def _append(path: str, content: str):
     with open(path, "a", encoding="utf-8") as f:
         f.write(content)
+
+def _memo_block_pattern(block_id: str) -> re.Pattern:
+    """生成匹配指定 block_id 的完整 block 正则"""
+    return re.compile(
+        r'<!-- block:' + re.escape(block_id) + r' -->[\s\S]*?<!-- /block -->'
+    )
+
+def _next_memo_block_seq(existing: str, base_ts: str) -> int:
+    """提取同一分钟前缀下已有的最大后缀值，返回下一个可用序号"""
+    matches = re.findall(
+        r'<!-- block:' + re.escape(base_ts) + r'(?:_(\d{3}))? -->',
+        existing
+    )
+    if not matches:
+        return 0
+    return max(int(s) if s else 0 for s in matches) + 1
 
 def _is_new_user(user_id: str) -> bool:
     d = _user_dir(user_id)
@@ -295,7 +327,7 @@ class MemoryPlugin(Star):
         _ensure_user(user_id)
         _write(_fpath(user_id, "profile.md"), content)
         logger.info(f"[memory] {user_id} profile 已更新")
-        yield event.plain_result("")
+        yield event.plain_result("✅ 用户画像已更新")
 
     @filter.llm_tool(name="update_soul")
     async def update_soul(self, event: AstrMessageEvent, content: str):
@@ -308,7 +340,7 @@ class MemoryPlugin(Star):
         _ensure_user(user_id)
         _write(_fpath(user_id, "soul.md"), content)
         logger.info(f"[memory] {user_id} soul 已更新")
-        yield event.plain_result("")
+        yield event.plain_result("✅ Soul 设定已更新")
 
     @filter.llm_tool(name="reset_profile")
     async def reset_profile(self, event: AstrMessageEvent):
@@ -444,7 +476,7 @@ class MemoryPlugin(Star):
         _ensure_user(user_id)
         _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
         logger.info(f"[memory] {user_id} TODO 已创建")
-        yield event.plain_result("")
+        yield event.plain_result("✅ TODO 已创建")
 
     @filter.llm_tool(name="complete_todo")
     async def complete_todo(self, event: AstrMessageEvent, item_index: int):
@@ -467,7 +499,7 @@ class MemoryPlugin(Star):
             return
         lines[unchecked[target]] = lines[unchecked[target]].replace("[ ]", "[x]", 1)
         _write(path, "\n".join(lines))
-        yield event.plain_result("")
+        yield event.plain_result(f"✅ 第 {item_index} 个任务已标记完成")
 
     @filter.llm_tool(name="update_todo")
     async def update_todo(self, event: AstrMessageEvent, items: str):
@@ -478,7 +510,7 @@ class MemoryPlugin(Star):
         """
         user_id = event.get_sender_id()
         _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
-        yield event.plain_result("")
+        yield event.plain_result("✅ TODO 已更新")
 
     @filter.llm_tool(name="clear_todo")
     async def clear_todo(self, event: AstrMessageEvent):
@@ -492,95 +524,83 @@ class MemoryPlugin(Star):
 
     # ── 备忘录写入 Tools ──────────────────────────────────
 
-    @filter.llm_tool(name="create_memo")
-    async def create_memo(self, event: AstrMessageEvent, items: str):
-        """在备忘录中批量新增待办事项。每条一行，格式为"标题|详情"，无详情则只写标题。
-用户提到"之后再做"、"有空再说"、"记一下"时询问是否记入。
+    @filter.llm_tool(name="add_memo_block")
+    async def add_memo_block(self, event: AstrMessageEvent, blocks: list):
+        """在备忘录中批量新增 block，每个 block 内容自由组织。用户提到待办事项时调用。
 
         Args:
-            items(string): 待办条目列表，每行一条。格式：标题|详情（详情可省略）。例如：\n买牛奶\n网站ICP备案|需要准备营业执照和域名证书
+            blocks(array[string]): block 内容列表，每个元素是一段完整 Markdown 内容
         """
         user_id = event.get_sender_id()
         _ensure_user(user_id)
         path = _fpath(user_id, "memo.md")
         existing = _read(path)
 
-        base_ts = _gen_id()
-        # 提取同一分钟前缀下已有的最大后缀值，避免删除中间条目后碰撞
-        suffixes = re.findall(
-            r'### \[' + re.escape(base_ts) + r'(?:_(\d{3}))?\]', existing
-        )
-        if suffixes:
-            max_seq = max(int(s) if s else 0 for s in suffixes)
-            next_seq = max_seq + 1
-        else:
-            next_seq = 0
-
-        lines = [l.strip() for l in items.strip().splitlines() if l.strip()]
-        if not lines:
-            yield event.plain_result("❌ 未提供任何条目")
+        if not isinstance(blocks, list):
+            yield event.plain_result("❌ blocks 参数格式错误")
             return
+
+        clean_blocks = [b.strip("\n") for b in blocks if isinstance(b, str) and b.strip()]
+        if not clean_blocks:
+            yield event.plain_result("❌ 未提供任何有效 block")
+            return
+
+        base_ts = _gen_id()
+        next_seq = _next_memo_block_seq(existing, base_ts)
 
         created_ids = []
-        for i, line in enumerate(lines):
+        entries = []
+        for i, content in enumerate(clean_blocks):
             seq = next_seq + i
-            memo_id = base_ts if seq == 0 else f"{base_ts}_{seq:03d}"
+            block_id = base_ts if seq == 0 else f"{base_ts}_{seq:03d}"
+            entries.append(f"<!-- block:{block_id} -->\n{content}\n<!-- /block -->")
+            created_ids.append(block_id)
 
-            parts = line.split("|", 1)
-            title = parts[0].strip()
-            detail = parts[1].strip() if len(parts) > 1 else ""
+        # 保证 block 之间有空行分隔
+        suffix = "\n\n" + "\n\n".join(entries) + "\n"
+        _append(path, suffix)
+        logger.info(f"[memory] {user_id} 备忘录批量新增 {len(created_ids)} 个 block：{created_ids}")
+        yield event.plain_result(f"✅ 已新增备忘录 block {len(created_ids)} 个")
 
-            entry = f"\n### [{memo_id}] {title}\n"
-            if detail:
-                entry += f"{detail}\n"
-            _append(path, entry)
-            created_ids.append(memo_id)
-
-        logger.info(f"[memory] {user_id} 备忘录批量新增 {len(created_ids)} 条：{created_ids}")
-        yield event.plain_result(f"✅ 已记入备忘录 {len(created_ids)} 条，ID：{', '.join(created_ids)}")
-
-    @filter.llm_tool(name="update_memo")
-    async def update_memo(self, event: AstrMessageEvent, memo_id: str, detail: str):
-        """更新备忘录某条目的详情，用于补充讨论结果或方案细节。
+    @filter.llm_tool(name="write_memo_block")
+    async def write_memo_block(self, event: AstrMessageEvent, block_id: str, content: str):
+        """按 block_id 覆盖写入某个备忘录 block 的内容，用于整理、合并或更新。
 
         Args:
-            memo_id(string): 备忘录条目 ID
-            detail(string): 新的详情内容，覆盖写入
+            block_id(string): 备忘录 block ID
+            content(string): 新的 block Markdown 内容，覆盖写入
         """
         user_id = event.get_sender_id()
         path = _fpath(user_id, "memo.md")
         raw = _read(path)
-        pattern = re.compile(
-            r'(### \[' + re.escape(memo_id) + r'\][^\n]*\n).*?(?=\n### |\Z)',
-            re.DOTALL
-        )
-        new_raw, n = pattern.subn(rf'\g<1>{detail.strip()}\n', raw)
+        pattern = _memo_block_pattern(block_id)
+        new_block = f"<!-- block:{block_id} -->\n{content.strip()}\n<!-- /block -->"
+        new_raw, n = pattern.subn(new_block, raw, count=1)
         if n == 0:
-            yield event.plain_result(f"❌ 未找到备忘录条目 {memo_id}")
+            yield event.plain_result(f"❌ 未找到备忘录 block {block_id}")
             return
         _write(path, new_raw)
-        yield event.plain_result(f"✅ 备忘录 {memo_id} 已更新")
+        yield event.plain_result(f"✅ 备忘录 block {block_id} 已更新")
 
-    @filter.llm_tool(name="delete_memo")
-    async def delete_memo(self, event: AstrMessageEvent, memo_id: str):
-        """删除备忘录中的某条待办。用户明确完成某事后调用。
+    @filter.llm_tool(name="delete_memo_block")
+    async def delete_memo_block(self, event: AstrMessageEvent, block_id: str):
+        """按 block_id 删除某个备忘录 block。用户明确完成某事后调用。
 
         Args:
-            memo_id(string): 要删除的备忘录条目 ID
+            block_id(string): 要删除的备忘录 block ID
         """
         user_id = event.get_sender_id()
         path = _fpath(user_id, "memo.md")
         raw = _read(path)
-        pattern = re.compile(
-            r'\n### \[' + re.escape(memo_id) + r'\][^\n]*\n.*?(?=\n### |\Z)',
-            re.DOTALL
-        )
-        new_raw, n = pattern.subn("", raw)
+        pattern = _memo_block_pattern(block_id)
+        new_raw, n = pattern.subn("", raw, count=1)
         if n == 0:
-            yield event.plain_result(f"❌ 未找到备忘录条目 {memo_id}")
+            yield event.plain_result(f"❌ 未找到备忘录 block {block_id}")
             return
+        # 清理删除后产生的连续空行，但保留文件头部内容
+        new_raw = re.sub(r'\n{3,}', '\n\n', new_raw).rstrip('\n') + '\n'
         _write(path, new_raw)
-        yield event.plain_result(f"✅ 备忘录条目 {memo_id} 已删除")
+        yield event.plain_result(f"✅ 备忘录 block {block_id} 已删除")
 
     async def terminate(self):
         logger.info("[memory] 插件已卸载")
