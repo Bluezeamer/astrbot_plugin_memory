@@ -1,0 +1,5 @@
+name: astrbot_plugin_memory
+desc: 跨会话持久化记忆插件。按用户 ID 存储画像、Soul 设定与历史摘要，在每次 LLM 请求前动态注入到 system_prompt 末尾，实现定制化的跨会话记忆。
+version: 1.0.0
+author: custom
+repo: ""
