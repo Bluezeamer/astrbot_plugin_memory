@@ -13,7 +13,9 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+.serena/
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
