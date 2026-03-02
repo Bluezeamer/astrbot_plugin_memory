@@ -7,13 +7,16 @@ astrbot_plugin_memory
 - FunctionTool（返回给 LLM）：read_memory_detail / read_todo
 - @filter.llm_tool（写入，return str 回传 LLM）：其余所有写入操作
 
-数据存储：/AstrBot/data/memory/{user_id}/
-  soul.md          - Soul 设定（注入）
-  profile.md       - 用户画像（注入）
-  history_index.md - 历史对话索引（注入）
-  history/         - 历史对话详情（按需 FunctionTool 读取）
-  memo.md          - 跨会话备忘录（注入）
-  todo.md          - 会话级 TODO（Agent 自主管理，FunctionTool 读取）
+数据存储：/AstrBot/data/memory/
+  templates/         - 全局模板目录（用户可自定义）
+    history_content.md - 历史记录 content 格式模板
+  {user_id}/
+    soul.md          - Soul 设定（注入）
+    profile.md       - 用户画像（注入）
+    history_index.md - 历史对话索引（注入）
+    history/         - 历史对话详情（按需 FunctionTool 读取）
+    memo.md          - 跨会话备忘录（注入）
+    todo.md          - 会话级 TODO（Agent 自主管理，FunctionTool 读取）
 """
 
 import os
@@ -33,6 +36,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 # ── 数据目录 ──────────────────────────────────────────────
 MEMORY_BASE = "/AstrBot/data/memory"
+TEMPLATE_DIR = os.path.join(MEMORY_BASE, "templates")
+HISTORY_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "history_content.md")
 
 # 沉淀记忆触发关键词
 _SAVE_KEYWORDS = ["沉淀记忆", "更新记忆", "收录记忆", "记住这次对话", "把这个记下来"]
@@ -48,36 +53,6 @@ _NEW_USER_HINT = """
 如果用户有其他紧迫需求，优先处理，不要强制引导。
 无论用户是否主动完善设定，在对话中要悄悄记住用户流露出的信息
 （习惯、偏好、背景、口癖等），通过 update_profile 工具静默写入，不向用户声明。
-"""
-
-_SAVE_HINT = """
-
-## 记忆沉淀指令
-用户希望沉淀本轮对话记忆。请先确认本轮对话是否还有需要调整的内容。
-确认无误后，使用 create_memory 工具记录本轮对话。
-
-content must follow this structure — one entry per user instruction, no merging:
-
-## Instruction N
-User: <exact original instruction, preserve wording>
-
-Decision:
-- Problem: what choice or obstacle was faced
-- Options: what alternatives were considered
-- Choice: what was selected
-- Reason: why
-
-Tools (if any):
-- tool_name | param=value | result summary
-
-Conclusion: <outcome of this instruction>
-
----
-
-Rules:
-- Each distinct user instruction = one separate entry. Never merge multiple instructions.
-- LLM responses are distilled into Decision and Conclusion only, not preserved verbatim.
-- Tool calls must record exact parameter values (e.g. location=Shenzhen, NOT just "queried weather").
 """
 
 _MEMO_GUIDE = """
@@ -208,6 +183,84 @@ def _write_if_absent(path: str, content: str):
     if not os.path.exists(path):
         _write(path, content)
 
+# ── 模板管理 ──────────────────────────────────────────────
+
+# 内置默认模板：仅约束 content 正文结构，不含 title/ID/Time 头部
+_DEFAULT_HISTORY_TEMPLATE = """\
+## 用户指令
+> YYYY-MM-DD HH:MM
+> <用户原始消息，保留原文>
+
+<一句话概括用户意图>
+
+## 助理回复
+<助理回复内容的精炼摘要；若有工具调用，穿插在对应位置描述：工具名 | 参数=值 | 结果摘要>
+
+---
+
+（如需记录多个交互回合，重复以上 ## 用户指令 / ## 助理回复 结构）
+
+规则（填写 content 时遵守，不要出现在最终内容中）：
+- content 只包含正文，必须从 `## 用户指令` 开始，不包含标题、ID、时间头部
+- 每个交互回合独立成对，保持时间顺序
+- 用户指令保留原文，下方一行简短说明意图（不加引号或标签）
+- 助理回复只摘要关键决策和结论，不逐字照抄
+- 工具调用信息穿插在对应回合内，格式：工具名 | 参数=值 | 结果摘要
+"""
+
+def _ensure_global_templates():
+    """若模板文件不存在则写入内置默认模板（首次启动初始化，不覆盖用户自定义）"""
+    os.makedirs(TEMPLATE_DIR, exist_ok=True)
+    _write_if_absent(HISTORY_TEMPLATE_PATH, _DEFAULT_HISTORY_TEMPLATE)
+
+def _read_history_template() -> str:
+    """读取用户自定义模板，读取失败则回退内置默认模板"""
+    try:
+        content = _read(HISTORY_TEMPLATE_PATH).strip()
+        return content if content else _DEFAULT_HISTORY_TEMPLATE
+    except Exception:
+        return _DEFAULT_HISTORY_TEMPLATE
+
+def _normalize_tags(tags) -> list:
+    """清洗标签列表：去空白、去重、过滤非法值，最多保留 5 个"""
+    if not isinstance(tags, list):
+        return []
+    seen, result = set(), []
+    for t in tags:
+        if not isinstance(t, str):
+            continue
+        v = t.strip()
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+            if len(result) >= 5:
+                break
+    return result
+
+def _format_tags(tags: list) -> str:
+    """将标签列表格式化为显示字符串，空列表返回空串"""
+    return " / ".join(tags) if tags else ""
+
+def _build_save_hint() -> str:
+    """动态构建记忆沉淀指令（每次注入时从模板文件读取，支持用户自定义）"""
+    template = _read_history_template()
+    return f"""
+
+## 记忆沉淀指令
+用户希望沉淀本轮对话记忆。请先确认本轮对话是否还有需要调整的内容。
+确认无误后，使用 create_memory 工具记录本轮对话。
+
+create_memory 参数说明：
+- title(string): 简洁的对话标题
+- summary(string): 一句话结论，仅用于索引检索
+- tags(array[string]): 分类标签，最多 5 个，例如 ["技术讨论", "用户画像"]（可为空数组）
+- content(string): 按对话回合组织的正文，必须从"## 用户指令"开始，不包含 title/ID/Time 头部
+
+content 格式模板（来自数据目录，用户可自定义）：
+
+{template}
+"""
+
 def _build_inject_block(user_id: str) -> str:
     """构建注入 system_prompt 的完整块：记忆 + 备忘录 + 行为引导"""
     soul    = _read(_fpath(user_id, "soul.md")).strip()
@@ -301,6 +354,7 @@ class MemoryPlugin(Star):
         super().__init__(context)
         # 只读 FunctionTool 通过 add_llm_tools 注册
         context.add_llm_tools(ReadMemoryDetail(), ReadTodo())
+        _ensure_global_templates()
         logger.info(f"[memory] 插件已加载，数据目录：{MEMORY_BASE}")
 
     # ── LLM 请求前注入 ────────────────────────────────────
@@ -320,7 +374,7 @@ class MemoryPlugin(Star):
 
         msg = event.message_str.strip()
         if any(kw in msg for kw in _SAVE_KEYWORDS):
-            inject += _SAVE_HINT
+            inject += _build_save_hint()
 
         req.system_prompt += inject
 
@@ -376,13 +430,15 @@ class MemoryPlugin(Star):
 
     @filter.llm_tool()
     async def create_memory(self, event: AstrMessageEvent,
-                            title: str, summary: str, content: str) -> str:
+                            title: str, summary: str, content: str,
+                            tags: list = None) -> str:
         """将本轮对话沉淀为历史记录。仅在用户明确要求沉淀记忆时调用。
 
         Args:
             title(string): 简洁的对话标题
             summary(string): 一句话结论，仅用于索引检索
-            content(string): 按指令单元结构组织的详细内容，每条用户指令必须单独成条，禁止合并
+            content(string): 按对话回合组织的正文，必须从"## 用户指令"开始，不包含 title/ID/Time 头部
+            tags(array[string]): 分类标签数组，最多 5 个（可为空数组）
         """
         user_id = event.get_sender_id()
         _ensure_user(user_id)
@@ -399,10 +455,19 @@ class MemoryPlugin(Star):
                 elif suffix_part.startswith("_") and suffix_part[1:].isdigit():
                     suffixes.append(int(suffix_part[1:]))
         record_id = f"{base_ts}_{max(suffixes) + 1:03d}" if suffixes else base_ts
-        detail = f"# {title}\n\nID: {record_id}\nTime: {_now()}\n\n{content}\n"
-        _write(_hpath(user_id, record_id), detail)
-        entry = f"\n## {_now()} {title}\nID：{record_id}\n摘要：{summary}\n详情：history/{record_id}.md\n"
-        _append(_fpath(user_id, "history_index.md"), entry)
+        tags_clean = _normalize_tags(tags)
+        tags_str = _format_tags(tags_clean)
+        # 详情文件头部：标签行仅在有标签时写入
+        header = f"# {title}\n\nID: {record_id}\nTime: {_now()}\n"
+        if tags_str:
+            header += f"标签：{tags_str}\n"
+        _write(_hpath(user_id, record_id), f"{header}\n{content}\n")
+        # 索引条目：标签行仅在有标签时写入
+        entry_lines = [f"\n## {_now()} {title}", f"ID：{record_id}"]
+        if tags_str:
+            entry_lines.append(f"标签：{tags_str}")
+        entry_lines += [f"摘要：{summary}", f"详情：history/{record_id}.md\n"]
+        _append(_fpath(user_id, "history_index.md"), "\n".join(entry_lines))
         logger.info(f"[memory] {user_id} 新建记忆 {record_id}")
         return f"memory saved, ID: {record_id}"
 
@@ -418,11 +483,31 @@ class MemoryPlugin(Star):
         user_id = event.get_sender_id()
         idx_path = _fpath(user_id, "history_index.md")
         idx = _read(idx_path)
-        pat = re.compile(r'(ID：' + re.escape(record_id) + r'\n)摘要：[^\n]*')
-        new_idx, n = pat.subn(rf'\g<1>摘要：{summary}', idx)
-        if n == 0:
+        # 按 "\n## " 分块，兼容索引条目中含任意字段（标签、摘要顺序不限）
+        sections = idx.split("\n## ")
+        record_found = False
+        for i, block in enumerate(sections):
+            if f"ID：{record_id}" not in block:
+                continue
+            record_found = True
+            lines = block.split("\n")
+            summary_updated = False
+            for j, line in enumerate(lines):
+                if line.startswith("摘要："):
+                    lines[j] = f"摘要：{summary}"
+                    summary_updated = True
+                    break
+            # 摘要行损坏或缺失时：在 ID 行后补写
+            if not summary_updated:
+                for j, line in enumerate(lines):
+                    if line.startswith("ID："):
+                        lines.insert(j + 1, f"摘要：{summary}")
+                        break
+            sections[i] = "\n".join(lines)
+            break
+        if not record_found:
             return f"record {record_id} not found"
-        _write(idx_path, new_idx)
+        _write(idx_path, "\n## ".join(sections))
         return f"memory {record_id} updated"
 
     @filter.llm_tool()
