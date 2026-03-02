@@ -347,7 +347,8 @@ class ReadTodo(FunctionTool[AstrAgentContext]):
 
 # ── 插件主体 ──────────────────────────────────────────────
 
-@register("astrbot_plugin_memory", "custom", "跨会话持久化记忆插件", "1.2.0", "")
+@register("astrbot_plugin_memory", "Bluezeamer", "跨会话持久化记忆插件", "1.2.0",
+          "https://github.com/Bluezeamer/astrbot_plugin_memory")
 class MemoryPlugin(Star):
 
     def __init__(self, context: Context):
