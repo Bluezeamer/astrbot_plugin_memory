@@ -43,20 +43,33 @@ AstrBot 跨会话持久化记忆插件。为每位用户独立维护 Soul 设定
 
 ## 数据存储
 
-所有用户数据存储在：
+所有用户数据存储在 AstrBot 数据目录下：
 
 ```
-/AstrBot/data/memory/{user_id}/
-├── soul.md            # Soul 设定
-├── profile.md         # 用户画像
-├── history_index.md   # 历史对话索引
-├── memo.md            # 跨会话备忘录
-├── todo.md            # 会话级 TODO
-└── history/           # 历史对话详情
-    └── <record_id>.md
+data/plugin_data/astrbot_plugin_memory/
+├── templates/         # 全局模板目录（用户可自定义）
+│   └── history_content.md
+└── {user_id}/
+    ├── soul.md            # Soul 设定
+    ├── profile.md         # 用户画像
+    ├── history_index.md   # 历史对话索引
+    ├── memo.md            # 跨会话备忘录
+    ├── todo.md            # 会话级 TODO
+    └── history/           # 历史对话详情
+        └── <record_id>.md
 ```
 
 数据与插件目录分离，更新插件不会丢失用户数据。
+
+### 从旧版本迁移
+
+v1.2.0 之前的版本数据存储在 `/AstrBot/data/memory/`，升级后需手动迁移：
+
+```bash
+cp -r /AstrBot/data/memory/* /AstrBot/data/plugin_data/astrbot_plugin_memory/
+```
+
+迁移完成并确认新版本正常运行后，可删除旧目录。
 
 ## LLM 工具列表
 

@@ -4,43 +4,47 @@ astrbot_plugin_memory
 
 架构：
 - on_llm_request 注入：soul / profile / history_index / memo / 行为引导
-- FunctionTool（返回给 LLM）：read_memory_detail / read_todo
+- @filter.llm_tool（返回给 LLM）：read_memory_detail / read_todo
 - @filter.llm_tool（写入，return str 回传 LLM）：其余所有写入操作
 
-数据存储：/AstrBot/data/memory/
+数据存储：data/plugin_data/astrbot_plugin_memory/
   templates/         - 全局模板目录（用户可自定义）
     history_content.md - 历史记录 content 格式模板
   {user_id}/
     soul.md          - Soul 设定（注入）
     profile.md       - 用户画像（注入）
     history_index.md - 历史对话索引（注入）
-    history/         - 历史对话详情（按需 FunctionTool 读取）
+    history/         - 历史对话详情（按需工具读取）
     memo.md          - 跨会话备忘录（注入）
-    todo.md          - 会话级 TODO（Agent 自主管理，FunctionTool 读取）
+    todo.md          - 会话级 TODO（Agent 自主管理，按需工具读取）
 """
 
 import os
 import re
 import datetime
 
-from pydantic import Field
-from pydantic.dataclasses import dataclass
-
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.provider import ProviderRequest, LLMResponse
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult
-from astrbot.core.astr_agent_context import AstrAgentContext
 
-# ── 数据目录 ──────────────────────────────────────────────
-MEMORY_BASE = "/AstrBot/data/memory"
-TEMPLATE_DIR = os.path.join(MEMORY_BASE, "templates")
-HISTORY_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "history_content.md")
+# ── 数据目录（在 __init__ 中动态初始化）─────────────────────
+MEMORY_BASE = ""
+TEMPLATE_DIR = ""
+HISTORY_TEMPLATE_PATH = ""
 
 # 沉淀记忆触发关键词
 _SAVE_KEYWORDS = ["沉淀记忆", "更新记忆", "收录记忆", "记住这次对话", "把这个记下来"]
+
+
+def _sanitize_user_id(user_id: str) -> str:
+    """过滤 user_id，仅保留字母、数字、下划线、连字符，防止路径遍历攻击"""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', user_id)
+
+def _sanitize_record_id(record_id: str) -> str:
+    """过滤 record_id，仅保留数字和下划线（预期格式如 202507121430 或 202507121430_001）"""
+    return re.sub(r'[^0-9_]', '', record_id)
+
 
 # ── 注入指令常量 ──────────────────────────────────────────
 
@@ -163,6 +167,11 @@ def _next_memo_block_seq(existing: str, base_ts: str) -> int:
     if not matches:
         return 0
     return max(int(s) if s else 0 for s in matches) + 1
+
+def _block_has_id(block: str, record_id: str) -> bool:
+    """行级精确匹配：检查 block 中是否有独立的 'ID：{record_id}' 行，避免子串误命中"""
+    target = f"ID：{record_id}"
+    return any(line.strip() == target for line in block.split("\n"))
 
 def _is_new_user(user_id: str) -> bool:
     d = _user_dir(user_id)
@@ -292,69 +301,21 @@ def _build_inject_block(user_id: str) -> str:
     return "\n".join(parts)
 
 
-# ── FunctionTool：返回给 LLM 的只读查询工具 ────────────────
-
-@dataclass
-class ReadMemoryDetail(FunctionTool[AstrAgentContext]):
-    name: str = "read_memory_detail"
-    description: str = "读取某条历史对话的详细内容。当历史索引中有相关记录需要深入了解时调用。结果返回给你用于推理，不会直接发给用户。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {
-                "type": "string",
-                "description": "用户 ID，从当前会话上下文获取"
-            },
-            "record_id": {
-                "type": "string",
-                "description": "历史记录 ID，从历史索引中获取，格式为分钟级时间戳如 202507121430"
-            }
-        },
-        "required": ["user_id", "record_id"]
-    })
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        record_id = kwargs.get("record_id", "")
-        detail = _read(_hpath(user_id, record_id))
-        if not detail:
-            return f"未找到记录 {record_id}"
-        return detail
-
-
-@dataclass
-class ReadTodo(FunctionTool[AstrAgentContext]):
-    name: str = "read_todo"
-    description: str = "读取当前会话的 TODO 列表。用于检查任务进度，结果返回给你用于推理，不会直接发给用户。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {
-                "type": "string",
-                "description": "用户 ID，从当前会话上下文获取"
-            }
-        },
-        "required": ["user_id"]
-    })
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        todo = _read(_fpath(user_id, "todo.md")).strip()
-        if not todo or todo == "# TODO":
-            return "当前无待办任务"
-        return todo
-
-
 # ── 插件主体 ──────────────────────────────────────────────
 
-@register("astrbot_plugin_memory", "Bluezeamer", "跨会话持久化记忆插件", "1.2.0",
+@register("astrbot_plugin_memory", "Bluezeamer", "跨会话持久化记忆插件", "1.3.0",
           "https://github.com/Bluezeamer/astrbot_plugin_memory")
 class MemoryPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 只读 FunctionTool 通过 add_llm_tools 注册
-        context.add_llm_tools(ReadMemoryDetail(), ReadTodo())
+        global MEMORY_BASE, TEMPLATE_DIR, HISTORY_TEMPLATE_PATH
+        # 按 AstrBot 约定：插件数据存储在 data/plugin_data/{plugin_name}/
+        # 插件代码位于 data/plugins/{plugin_name}/main.py，向上两级即 data/
+        _data_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        MEMORY_BASE = os.path.join(_data_root, "plugin_data", self.name)
+        TEMPLATE_DIR = os.path.join(MEMORY_BASE, "templates")
+        HISTORY_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "history_content.md")
         _ensure_global_templates()
         logger.info(f"[memory] 插件已加载，数据目录：{MEMORY_BASE}")
 
@@ -363,6 +324,7 @@ class MemoryPlugin(Star):
     @filter.on_llm_request()
     async def inject_memory(self, event: AstrMessageEvent, req: ProviderRequest):
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         is_new = _is_new_user(user_id)
 
         if is_new:
@@ -379,6 +341,31 @@ class MemoryPlugin(Star):
 
         req.system_prompt += inject
 
+    # ── 只读查询 Tools（return str 回传 LLM 推理）────────────
+
+    @filter.llm_tool()
+    async def read_memory_detail(self, event: AstrMessageEvent, record_id: str) -> str:
+        """读取某条历史对话的详细内容。当历史索引中有相关记录需要深入了解时调用。结果返回给你用于推理，不会直接发给用户。
+
+        Args:
+            record_id(string): 历史记录 ID，从历史索引中获取，格式为分钟级时间戳如 202507121430
+        """
+        user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
+        record_id = _sanitize_record_id(record_id)
+        detail = _read(_hpath(user_id, record_id))
+        if not detail:
+            return f"未找到记录 {record_id}"
+        return detail
+
+    @filter.llm_tool()
+    async def read_todo(self, event: AstrMessageEvent) -> str:
+        """读取当前会话的 TODO 列表。用于检查任务进度，结果返回给你用于推理，不会直接发给用户。"""
+        user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
+        todo = _read(_fpath(user_id, "todo.md")).strip()
+        return "当前无待办任务" if (not todo or todo == "# TODO") else todo
+
     # ── 记忆写入 Tools（return str 回传 LLM 继续推理）─────
 
     @filter.llm_tool()
@@ -389,6 +376,7 @@ class MemoryPlugin(Star):
             content(string): 完整的用户画像 Markdown 内容，覆盖写入
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _ensure_user(user_id)
         _write(_fpath(user_id, "profile.md"), content)
         logger.info(f"[memory] {user_id} profile 已更新")
@@ -402,6 +390,7 @@ class MemoryPlugin(Star):
             content(string): 完整的 Soul 设定 Markdown 内容，覆盖写入
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _ensure_user(user_id)
         _write(_fpath(user_id, "soul.md"), content)
         logger.info(f"[memory] {user_id} soul 已更新")
@@ -414,6 +403,7 @@ class MemoryPlugin(Star):
         Args:
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _write(_fpath(user_id, "profile.md"),
                "# 用户画像\n\n（待完善：用户背景、习惯、偏好、所在地等）\n")
         return "profile reset"
@@ -425,6 +415,7 @@ class MemoryPlugin(Star):
         Args:
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _write(_fpath(user_id, "soul.md"),
                "# Soul 设定\n\n（待完善：助理名称、对用户的称呼、人格风格、行为约束等）\n")
         return "soul reset"
@@ -442,6 +433,7 @@ class MemoryPlugin(Star):
             tags(array[string]): 分类标签数组，最多 5 个（可为空数组）
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _ensure_user(user_id)
         base_ts = _gen_id()
         h_dir = _history_dir(user_id)
@@ -482,13 +474,15 @@ class MemoryPlugin(Star):
             summary(string): 新的一句话摘要
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
+        record_id = _sanitize_record_id(record_id)
         idx_path = _fpath(user_id, "history_index.md")
         idx = _read(idx_path)
         # 按 "\n## " 分块，兼容索引条目中含任意字段（标签、摘要顺序不限）
         sections = idx.split("\n## ")
         record_found = False
         for i, block in enumerate(sections):
-            if f"ID：{record_id}" not in block:
+            if not _block_has_id(block, record_id):
                 continue
             record_found = True
             lines = block.split("\n")
@@ -519,6 +513,8 @@ class MemoryPlugin(Star):
             record_id(string): 要删除的历史记录 ID
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
+        record_id = _sanitize_record_id(record_id)
         removed = False
         path = _hpath(user_id, record_id)
         if os.path.exists(path):
@@ -526,13 +522,12 @@ class MemoryPlugin(Star):
             removed = True
         idx_path = _fpath(user_id, "history_index.md")
         idx = _read(idx_path)
-        pat = re.compile(
-            r'\n## [^\n]+\nID：' + re.escape(record_id) + r'\n.*?(?=\n## |\Z)',
-            re.DOTALL
-        )
-        new_idx, count = pat.subn("", idx)
-        if count > 0:
-            _write(idx_path, new_idx)
+        # block-split 方案，兼容首条记录（前面无 "\n## " 前缀的情况）
+        sections = idx.split("\n## ")
+        filtered = [block for block in sections
+                    if not _block_has_id(block, record_id)]
+        if len(filtered) != len(sections):
+            _write(idx_path, "\n## ".join(filtered))
             removed = True
         return f"deleted {record_id}" if removed else f"record {record_id} not found"
 
@@ -546,6 +541,7 @@ class MemoryPlugin(Star):
             items(string): 每行一个条目，格式为 '[ ] 任务描述'，多个条目用换行分隔
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _ensure_user(user_id)
         _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
         logger.info(f"[memory] {user_id} TODO 已创建")
@@ -559,6 +555,7 @@ class MemoryPlugin(Star):
             item_index(number): 未完成条目的序号，从 1 开始
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         path = _fpath(user_id, "todo.md")
         raw = _read(path)
         if not raw:
@@ -580,6 +577,7 @@ class MemoryPlugin(Star):
             items(string): 完整的 TODO 条目内容，覆盖写入
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
         return "todo updated"
 
@@ -590,6 +588,7 @@ class MemoryPlugin(Star):
         Args:
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _write(_fpath(user_id, "todo.md"), "# TODO\n\n")
         return "todo cleared"
 
@@ -603,6 +602,7 @@ class MemoryPlugin(Star):
             blocks(array[string]): block 内容列表，每个元素是一段完整 Markdown 内容
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         _ensure_user(user_id)
         path = _fpath(user_id, "memo.md")
         existing = _read(path)
@@ -634,6 +634,7 @@ class MemoryPlugin(Star):
             content(string): 新的 block Markdown 内容，覆盖写入
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         path = _fpath(user_id, "memo.md")
         raw = _read(path)
         pattern = _memo_block_pattern(block_id)
@@ -652,6 +653,7 @@ class MemoryPlugin(Star):
             block_id(string): 要删除的备忘录 block ID
         """
         user_id = event.get_sender_id()
+        user_id = _sanitize_user_id(user_id)
         path = _fpath(user_id, "memo.md")
         raw = _read(path)
         pattern = _memo_block_pattern(block_id)
