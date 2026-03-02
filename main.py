@@ -25,7 +25,7 @@ import datetime
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import StarTools, Context, Star, register
 from astrbot.api import logger
 
 # ── 数据目录（在 __init__ 中动态初始化）─────────────────────
@@ -41,9 +41,14 @@ def _sanitize_user_id(user_id: str) -> str:
     """过滤 user_id，仅保留字母、数字、下划线、连字符，防止路径遍历攻击"""
     return re.sub(r'[^a-zA-Z0-9_\-]', '_', user_id)
 
-def _sanitize_record_id(record_id: str) -> str:
-    """过滤 record_id，仅保留数字和下划线（预期格式如 202507121430 或 202507121430_001）"""
-    return re.sub(r'[^0-9_]', '', record_id)
+def _sanitize_record_id(record_id: str):
+    """过滤 record_id，仅保留数字和下划线（预期格式如 202507121430 或 202507121430_001）。
+    若过滤后为空（输入含非法字符且无有效内容）则返回 None，调用方应拒绝后续操作。
+    """
+    if not isinstance(record_id, str):
+        return None
+    cleaned = re.sub(r'[^0-9_]', '', record_id)
+    return cleaned if cleaned else None
 
 
 # ── 注入指令常量 ──────────────────────────────────────────
@@ -310,12 +315,12 @@ class MemoryPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         global MEMORY_BASE, TEMPLATE_DIR, HISTORY_TEMPLATE_PATH
-        # 按 AstrBot 约定：插件数据存储在 data/plugin_data/{plugin_name}/
-        # 插件代码位于 data/plugins/{plugin_name}/main.py，向上两级即 data/
-        _data_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        MEMORY_BASE = os.path.join(_data_root, "plugin_data", self.name)
-        TEMPLATE_DIR = os.path.join(MEMORY_BASE, "templates")
-        HISTORY_TEMPLATE_PATH = os.path.join(TEMPLATE_DIR, "history_content.md")
+        # AstrBot 4.9.2+：StarTools.get_data_dir() 返回 data/plugin_data/{plugin_name}/
+        # 对应的 Path 对象，并自动创建该目录
+        data_dir = StarTools.get_data_dir(self.name)
+        MEMORY_BASE = str(data_dir)
+        TEMPLATE_DIR = str(data_dir / "templates")
+        HISTORY_TEMPLATE_PATH = str(data_dir / "templates" / "history_content.md")
         _ensure_global_templates()
         logger.info(f"[memory] 插件已加载，数据目录：{MEMORY_BASE}")
 
@@ -339,7 +344,7 @@ class MemoryPlugin(Star):
         if any(kw in msg for kw in _SAVE_KEYWORDS):
             inject += _build_save_hint()
 
-        req.system_prompt += inject
+        req.system_prompt = (req.system_prompt or "") + inject
 
     # ── 只读查询 Tools（return str 回传 LLM 推理）────────────
 
@@ -353,6 +358,8 @@ class MemoryPlugin(Star):
         user_id = event.get_sender_id()
         user_id = _sanitize_user_id(user_id)
         record_id = _sanitize_record_id(record_id)
+        if not record_id:
+            return "invalid record_id"
         detail = _read(_hpath(user_id, record_id))
         if not detail:
             return f"未找到记录 {record_id}"
@@ -448,6 +455,13 @@ class MemoryPlugin(Star):
                 elif suffix_part.startswith("_") and suffix_part[1:].isdigit():
                     suffixes.append(int(suffix_part[1:]))
         record_id = f"{base_ts}_{max(suffixes) + 1:03d}" if suffixes else base_ts
+        # 并发兜底：若目标文件已存在则递增后缀直到找到可用 ID
+        while os.path.exists(_hpath(user_id, record_id)):
+            if "_" in record_id and record_id.rsplit("_", 1)[1].isdigit():
+                prefix, seq = record_id.rsplit("_", 1)
+                record_id = f"{prefix}_{int(seq) + 1:03d}"
+            else:
+                record_id = f"{base_ts}_001"
         tags_clean = _normalize_tags(tags)
         tags_str = _format_tags(tags_clean)
         # 详情文件头部：标签行仅在有标签时写入
@@ -476,6 +490,8 @@ class MemoryPlugin(Star):
         user_id = event.get_sender_id()
         user_id = _sanitize_user_id(user_id)
         record_id = _sanitize_record_id(record_id)
+        if not record_id:
+            return "invalid record_id"
         idx_path = _fpath(user_id, "history_index.md")
         idx = _read(idx_path)
         # 按 "\n## " 分块，兼容索引条目中含任意字段（标签、摘要顺序不限）
@@ -515,6 +531,8 @@ class MemoryPlugin(Star):
         user_id = event.get_sender_id()
         user_id = _sanitize_user_id(user_id)
         record_id = _sanitize_record_id(record_id)
+        if not record_id:
+            return "invalid record_id"
         removed = False
         path = _hpath(user_id, record_id)
         if os.path.exists(path):
