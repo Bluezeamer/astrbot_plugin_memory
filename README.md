@@ -14,17 +14,26 @@ AstrBot 跨会话持久化记忆插件。为每位用户独立维护 Soul 设定
 
 ## 安装
 
-### 方式一：通过 WebUI 插件市场（暂时不可用）
+### 方式一：通过 WebUI 输入 GitHub 链接安装（推荐）
 
-在 AstrBot 后台管理界面，进入**插件**页面，搜索 `astrbot_plugin_memory` 一键安装。
+1. 打开 AstrBot 后台管理界面，进入**插件**页面。
+2. 点击**安装插件**，在输入框中粘贴本仓库的 GitHub 链接：
 
-### 方式二：手动安装（本地目录 - 目前可用）
+   ```
+   https://github.com/Bluezeamer/astrbot_plugin_memory
+   ```
+
+3. 点击确认，AstrBot 会自动拉取并安装插件，无需手动操作。
+
+> **提示**：后续版本更新时，同样在插件页面点击**更新**即可自动拉取最新代码。
+
+### 方式二：手动安装（本地目录）
 
 1. 将本仓库克隆或下载到 AstrBot 的插件目录：
 
    ```bash
    cd /AstrBot/data/plugins
-   git clone https://github.com/<your-repo>/astrbot_plugin_memory.git
+   git clone https://github.com/Bluezeamer/astrbot_plugin_memory.git
    ```
 
    或者直接将项目文件夹复制进去，保证目录结构如下：
