@@ -5,7 +5,7 @@ astrbot_plugin_memory
 架构：
 - on_llm_request 注入：soul / profile / history_index / memo / 行为引导
 - FunctionTool（返回给 LLM）：read_memory_detail / read_todo
-- 装饰器 tool（写入，静默）：其余所有写入操作
+- @filter.llm_tool（写入，return str 回传 LLM）：其余所有写入操作
 
 数据存储：/AstrBot/data/memory/{user_id}/
   soul.md          - Soul 设定（注入）
@@ -239,7 +239,7 @@ def _build_inject_block(user_id: str) -> str:
     return "\n".join(parts)
 
 
-# ── FunctionTool：返回给 LLM 的查询工具 ──────────────────
+# ── FunctionTool：返回给 LLM 的只读查询工具 ────────────────
 
 @dataclass
 class ReadMemoryDetail(FunctionTool[AstrAgentContext]):
@@ -292,371 +292,15 @@ class ReadTodo(FunctionTool[AstrAgentContext]):
         return todo
 
 
-@dataclass
-class UpdateProfile(FunctionTool[AstrAgentContext]):
-    name: str = "update_profile"
-    description: str = "更新用户画像。对话中识别到用户习惯、偏好、背景等信息时静默调用，无需告知用户。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "content": {"type": "string", "description": "完整的用户画像 Markdown 内容，覆盖写入"}
-        },
-        "required": ["user_id", "content"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _ensure_user(user_id)
-        _write(_fpath(user_id, "profile.md"), kwargs["content"])
-        logger.info(f"[memory] {user_id} profile 已更新")
-        return "profile updated"
-
-
-@dataclass
-class UpdateSoul(FunctionTool[AstrAgentContext]):
-    name: str = "update_soul"
-    description: str = "更新 Soul 设定。用户对助理的人格、名字、称呼或行为提出持久化要求时调用。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "content": {"type": "string", "description": "完整的 Soul 设定 Markdown 内容，覆盖写入"}
-        },
-        "required": ["user_id", "content"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _ensure_user(user_id)
-        _write(_fpath(user_id, "soul.md"), kwargs["content"])
-        logger.info(f"[memory] {user_id} soul 已更新")
-        return "soul updated"
-
-
-@dataclass
-class ResetProfile(FunctionTool[AstrAgentContext]):
-    name: str = "reset_profile"
-    description: str = "将用户画像重置为空模板。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"}
-        },
-        "required": ["user_id"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _write(_fpath(user_id, "profile.md"), "# 用户画像\n\n（待完善：用户背景、习惯、偏好、所在地等）\n")
-        return "profile reset"
-
-
-@dataclass
-class ResetSoul(FunctionTool[AstrAgentContext]):
-    name: str = "reset_soul"
-    description: str = "将 Soul 设定重置为空模板。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"}
-        },
-        "required": ["user_id"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _write(_fpath(user_id, "soul.md"), "# Soul 设定\n\n（待完善：助理名称、对用户的称呼、人格风格、行为约束等）\n")
-        return "soul reset"
-
-
-@dataclass
-class CreateMemory(FunctionTool[AstrAgentContext]):
-    name: str = "create_memory"
-    description: str = "将本轮对话沉淀为历史记录。仅在用户明确要求沉淀记忆时调用。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "title": {"type": "string", "description": "简洁的对话标题"},
-            "summary": {"type": "string", "description": "一句话结论，仅用于索引检索"},
-            "content": {"type": "string", "description": "按指令单元结构组织的详细内容，每条用户指令必须单独成条，禁止合并"}
-        },
-        "required": ["user_id", "title", "summary", "content"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        title = kwargs.get("title", "")
-        summary = kwargs.get("summary", "")
-        content = kwargs.get("content", "")
-        _ensure_user(user_id)
-        base_ts = _gen_id()
-        h_dir = _history_dir(user_id)
-        existing_files = os.listdir(h_dir) if os.path.exists(h_dir) else []
-        suffixes = []
-        for fname in existing_files:
-            if fname.startswith(base_ts) and fname.endswith(".md"):
-                stem = fname[:-3]
-                suffix_part = stem[len(base_ts):]
-                if not suffix_part:
-                    suffixes.append(0)
-                elif suffix_part.startswith("_") and suffix_part[1:].isdigit():
-                    suffixes.append(int(suffix_part[1:]))
-        record_id = f"{base_ts}_{max(suffixes) + 1:03d}" if suffixes else base_ts
-        detail = f"# {title}\n\nID: {record_id}\nTime: {_now()}\n\n{content}\n"
-        _write(_hpath(user_id, record_id), detail)
-        entry = f"\n## {_now()} {title}\nID：{record_id}\n摘要：{summary}\n详情：history/{record_id}.md\n"
-        _append(_fpath(user_id, "history_index.md"), entry)
-        logger.info(f"[memory] {user_id} 新建记忆 {record_id}")
-        return f"memory saved, ID: {record_id}"
-
-
-@dataclass
-class UpdateMemory(FunctionTool[AstrAgentContext]):
-    name: str = "update_memory"
-    description: str = "更新索引中某条历史记录的摘要。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "record_id": {"type": "string", "description": "历史记录 ID"},
-            "summary": {"type": "string", "description": "新的一句话摘要"}
-        },
-        "required": ["user_id", "record_id", "summary"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        record_id = kwargs.get("record_id", "")
-        summary = kwargs.get("summary", "")
-        idx_path = _fpath(user_id, "history_index.md")
-        idx = _read(idx_path)
-        pat = re.compile(r'(ID：' + re.escape(record_id) + r'\n)摘要：[^\n]*')
-        new_idx, n = pat.subn(rf'\g<1>摘要：{summary}', idx)
-        if n == 0:
-            return f"record {record_id} not found"
-        _write(idx_path, new_idx)
-        return f"memory {record_id} updated"
-
-
-@dataclass
-class DeleteMemory(FunctionTool[AstrAgentContext]):
-    name: str = "delete_memory"
-    description: str = "删除某条历史记录，同步清理索引条目和详情文件。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "record_id": {"type": "string", "description": "要删除的历史记录 ID"}
-        },
-        "required": ["user_id", "record_id"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        record_id = kwargs.get("record_id", "")
-        removed = False
-        path = _hpath(user_id, record_id)
-        if os.path.exists(path):
-            os.remove(path)
-            removed = True
-        idx_path = _fpath(user_id, "history_index.md")
-        idx = _read(idx_path)
-        pat = re.compile(
-            r'\n## [^\n]+\nID：' + re.escape(record_id) + r'\n.*?(?=\n## |\Z)',
-            re.DOTALL
-        )
-        new_idx, count = pat.subn("", idx)
-        if count > 0:
-            _write(idx_path, new_idx)
-            removed = True
-        return f"deleted {record_id}" if removed else f"record {record_id} not found"
-
-
-@dataclass
-class CreateTodo(FunctionTool[AstrAgentContext]):
-    name: str = "create_todo"
-    description: str = "创建当前会话的 TODO 列表。用户提出多个问题或任务涉及多步骤时主动调用。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "items": {"type": "string", "description": "每行一个条目，格式为 '[ ] 任务描述'，多个条目用换行分隔"}
-        },
-        "required": ["user_id", "items"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _ensure_user(user_id)
-        _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{kwargs['items']}\n")
-        logger.info(f"[memory] {user_id} TODO 已创建")
-        return "todo created"
-
-
-@dataclass
-class CompleteTodo(FunctionTool[AstrAgentContext]):
-    name: str = "complete_todo"
-    description: str = "将 TODO 中第 N 个未完成任务标记为已完成。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "item_index": {"type": "number", "description": "未完成条目的序号，从 1 开始"}
-        },
-        "required": ["user_id", "item_index"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        item_index = int(kwargs.get("item_index", 1))
-        path = _fpath(user_id, "todo.md")
-        raw = _read(path)
-        if not raw:
-            return "no todos found"
-        lines = raw.split("\n")
-        unchecked = [i for i, l in enumerate(lines) if l.strip().startswith("[ ]")]
-        target = item_index - 1
-        if target < 0 or target >= len(unchecked):
-            return f"index {item_index} out of range"
-        lines[unchecked[target]] = lines[unchecked[target]].replace("[ ]", "[x]", 1)
-        _write(path, "\n".join(lines))
-        return f"todo item {item_index} completed"
-
-
-@dataclass
-class UpdateTodo(FunctionTool[AstrAgentContext]):
-    name: str = "update_todo"
-    description: str = "覆盖更新整个 TODO 列表。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "items": {"type": "string", "description": "完整的 TODO 条目内容，覆盖写入"}
-        },
-        "required": ["user_id", "items"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{kwargs['items']}\n")
-        return "todo updated"
-
-
-@dataclass
-class ClearTodo(FunctionTool[AstrAgentContext]):
-    name: str = "clear_todo"
-    description: str = "清空当前 TODO 列表。所有任务完成后调用。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"}
-        },
-        "required": ["user_id"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        _write(_fpath(kwargs.get("user_id", ""), "todo.md"), "# TODO\n\n")
-        return "todo cleared"
-
-
-@dataclass
-class AddMemoBlock(FunctionTool[AstrAgentContext]):
-    name: str = "add_memo_block"
-    description: str = "在备忘录中批量新增 block，每个 block 内容自由组织。用户提到待办事项时调用。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "blocks": {"type": "array", "items": {"type": "string"}, "description": "block 内容列表，每个元素是一段完整 Markdown 内容"}
-        },
-        "required": ["user_id", "blocks"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        blocks = kwargs.get("blocks", [])
-        _ensure_user(user_id)
-        path = _fpath(user_id, "memo.md")
-        existing = _read(path)
-        if not isinstance(blocks, list):
-            return "error: blocks must be a list"
-        clean_blocks = [b.strip("\n") for b in blocks if isinstance(b, str) and b.strip()]
-        if not clean_blocks:
-            return "error: no valid blocks provided"
-        base_ts = _gen_id()
-        next_seq = _next_memo_block_seq(existing, base_ts)
-        created_ids = []
-        entries = []
-        for i, c in enumerate(clean_blocks):
-            seq = next_seq + i
-            block_id = base_ts if seq == 0 else f"{base_ts}_{seq:03d}"
-            entries.append(f"<!-- block:{block_id} -->\n{c}\n<!-- /block -->")
-            created_ids.append(block_id)
-        _append(path, "\n\n" + "\n\n".join(entries) + "\n")
-        logger.info(f"[memory] {user_id} 备忘录批量新增 {len(created_ids)} 个 block：{created_ids}")
-        return f"added {len(created_ids)} memo blocks: {created_ids}"
-
-
-@dataclass
-class WriteMemoBlock(FunctionTool[AstrAgentContext]):
-    name: str = "write_memo_block"
-    description: str = "按 block_id 覆盖写入某个备忘录 block 的内容，用于整理、合并或更新。部分修改时优先使用此工具而非删除。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "block_id": {"type": "string", "description": "备忘录 block ID"},
-            "content": {"type": "string", "description": "新的 block Markdown 内容，覆盖写入"}
-        },
-        "required": ["user_id", "block_id", "content"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        block_id = kwargs.get("block_id", "")
-        content = kwargs.get("content", "")
-        path = _fpath(user_id, "memo.md")
-        raw = _read(path)
-        pattern = _memo_block_pattern(block_id)
-        new_block = f"<!-- block:{block_id} -->\n{content.strip()}\n<!-- /block -->"
-        new_raw, n = pattern.subn(new_block, raw, count=1)
-        if n == 0:
-            return f"block {block_id} not found"
-        _write(path, new_raw)
-        return f"memo block {block_id} updated"
-
-
-@dataclass
-class DeleteMemoBlock(FunctionTool[AstrAgentContext]):
-    name: str = "delete_memo_block"
-    description: str = "按 block_id 删除某个备忘录 block。仅在整个 block 的全部内容均已完成或作废时调用。若只需移除 block 内的部分内容，应使用 write_memo_block 覆盖写入。"
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "user_id": {"type": "string", "description": "用户 ID，从当前会话上下文获取"},
-            "block_id": {"type": "string", "description": "要删除的备忘录 block ID"}
-        },
-        "required": ["user_id", "block_id"]
-    })
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
-        user_id = kwargs.get("user_id", "")
-        block_id = kwargs.get("block_id", "")
-        path = _fpath(user_id, "memo.md")
-        raw = _read(path)
-        pattern = _memo_block_pattern(block_id)
-        new_raw, n = pattern.subn("", raw, count=1)
-        if n == 0:
-            return f"block {block_id} not found"
-        new_raw = re.sub(r'\n{3,}', '\n\n', new_raw).rstrip('\n') + '\n'
-        _write(path, new_raw)
-        return f"memo block {block_id} deleted"
-
-
-
 # ── 插件主体 ──────────────────────────────────────────────
 
-@register("astrbot_plugin_memory", "custom", "跨会话持久化记忆插件", "1.1.0", "")
+@register("astrbot_plugin_memory", "custom", "跨会话持久化记忆插件", "1.2.0", "")
 class MemoryPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # 注册所有 FunctionTool
-        context.add_llm_tools(
-            UpdateProfile(), UpdateSoul(), ResetProfile(), ResetSoul(),
-            CreateMemory(), UpdateMemory(), DeleteMemory(),
-            ReadMemoryDetail(),
-            CreateTodo(), ReadTodo(), CompleteTodo(), UpdateTodo(), ClearTodo(),
-            AddMemoBlock(), WriteMemoBlock(), DeleteMemoBlock(),
-        )
+        # 只读 FunctionTool 通过 add_llm_tools 注册
+        context.add_llm_tools(ReadMemoryDetail(), ReadTodo())
         logger.info(f"[memory] 插件已加载，数据目录：{MEMORY_BASE}")
 
     # ── LLM 请求前注入 ────────────────────────────────────
@@ -679,6 +323,258 @@ class MemoryPlugin(Star):
             inject += _SAVE_HINT
 
         req.system_prompt += inject
+
+    # ── 记忆写入 Tools（return str 回传 LLM 继续推理）─────
+
+    @filter.llm_tool()
+    async def update_profile(self, event: AstrMessageEvent, content: str) -> str:
+        """更新用户画像。对话中识别到用户习惯、偏好、背景等信息时静默调用，无需告知用户。
+
+        Args:
+            content(string): 完整的用户画像 Markdown 内容，覆盖写入
+        """
+        user_id = event.get_sender_id()
+        _ensure_user(user_id)
+        _write(_fpath(user_id, "profile.md"), content)
+        logger.info(f"[memory] {user_id} profile 已更新")
+        return "profile updated"
+
+    @filter.llm_tool()
+    async def update_soul(self, event: AstrMessageEvent, content: str) -> str:
+        """更新 Soul 设定。用户对助理的人格、名字、称呼或行为提出持久化要求时调用。
+
+        Args:
+            content(string): 完整的 Soul 设定 Markdown 内容，覆盖写入
+        """
+        user_id = event.get_sender_id()
+        _ensure_user(user_id)
+        _write(_fpath(user_id, "soul.md"), content)
+        logger.info(f"[memory] {user_id} soul 已更新")
+        return "soul updated"
+
+    @filter.llm_tool()
+    async def reset_profile(self, event: AstrMessageEvent) -> str:
+        """将用户画像重置为空模板。
+
+        Args:
+        """
+        user_id = event.get_sender_id()
+        _write(_fpath(user_id, "profile.md"),
+               "# 用户画像\n\n（待完善：用户背景、习惯、偏好、所在地等）\n")
+        return "profile reset"
+
+    @filter.llm_tool()
+    async def reset_soul(self, event: AstrMessageEvent) -> str:
+        """将 Soul 设定重置为空模板。
+
+        Args:
+        """
+        user_id = event.get_sender_id()
+        _write(_fpath(user_id, "soul.md"),
+               "# Soul 设定\n\n（待完善：助理名称、对用户的称呼、人格风格、行为约束等）\n")
+        return "soul reset"
+
+    @filter.llm_tool()
+    async def create_memory(self, event: AstrMessageEvent,
+                            title: str, summary: str, content: str) -> str:
+        """将本轮对话沉淀为历史记录。仅在用户明确要求沉淀记忆时调用。
+
+        Args:
+            title(string): 简洁的对话标题
+            summary(string): 一句话结论，仅用于索引检索
+            content(string): 按指令单元结构组织的详细内容，每条用户指令必须单独成条，禁止合并
+        """
+        user_id = event.get_sender_id()
+        _ensure_user(user_id)
+        base_ts = _gen_id()
+        h_dir = _history_dir(user_id)
+        existing_files = os.listdir(h_dir) if os.path.exists(h_dir) else []
+        suffixes = []
+        for fname in existing_files:
+            if fname.startswith(base_ts) and fname.endswith(".md"):
+                stem = fname[:-3]
+                suffix_part = stem[len(base_ts):]
+                if not suffix_part:
+                    suffixes.append(0)
+                elif suffix_part.startswith("_") and suffix_part[1:].isdigit():
+                    suffixes.append(int(suffix_part[1:]))
+        record_id = f"{base_ts}_{max(suffixes) + 1:03d}" if suffixes else base_ts
+        detail = f"# {title}\n\nID: {record_id}\nTime: {_now()}\n\n{content}\n"
+        _write(_hpath(user_id, record_id), detail)
+        entry = f"\n## {_now()} {title}\nID：{record_id}\n摘要：{summary}\n详情：history/{record_id}.md\n"
+        _append(_fpath(user_id, "history_index.md"), entry)
+        logger.info(f"[memory] {user_id} 新建记忆 {record_id}")
+        return f"memory saved, ID: {record_id}"
+
+    @filter.llm_tool()
+    async def update_memory(self, event: AstrMessageEvent,
+                            record_id: str, summary: str) -> str:
+        """更新索引中某条历史记录的摘要。
+
+        Args:
+            record_id(string): 历史记录 ID
+            summary(string): 新的一句话摘要
+        """
+        user_id = event.get_sender_id()
+        idx_path = _fpath(user_id, "history_index.md")
+        idx = _read(idx_path)
+        pat = re.compile(r'(ID：' + re.escape(record_id) + r'\n)摘要：[^\n]*')
+        new_idx, n = pat.subn(rf'\g<1>摘要：{summary}', idx)
+        if n == 0:
+            return f"record {record_id} not found"
+        _write(idx_path, new_idx)
+        return f"memory {record_id} updated"
+
+    @filter.llm_tool()
+    async def delete_memory(self, event: AstrMessageEvent, record_id: str) -> str:
+        """删除某条历史记录，同步清理索引条目和详情文件。
+
+        Args:
+            record_id(string): 要删除的历史记录 ID
+        """
+        user_id = event.get_sender_id()
+        removed = False
+        path = _hpath(user_id, record_id)
+        if os.path.exists(path):
+            os.remove(path)
+            removed = True
+        idx_path = _fpath(user_id, "history_index.md")
+        idx = _read(idx_path)
+        pat = re.compile(
+            r'\n## [^\n]+\nID：' + re.escape(record_id) + r'\n.*?(?=\n## |\Z)',
+            re.DOTALL
+        )
+        new_idx, count = pat.subn("", idx)
+        if count > 0:
+            _write(idx_path, new_idx)
+            removed = True
+        return f"deleted {record_id}" if removed else f"record {record_id} not found"
+
+    # ── TODO 写入 Tools ───────────────────────────────────
+
+    @filter.llm_tool()
+    async def create_todo(self, event: AstrMessageEvent, items: str) -> str:
+        """创建当前会话的 TODO 列表。用户提出多个问题或任务涉及多步骤时主动调用。
+
+        Args:
+            items(string): 每行一个条目，格式为 '[ ] 任务描述'，多个条目用换行分隔
+        """
+        user_id = event.get_sender_id()
+        _ensure_user(user_id)
+        _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
+        logger.info(f"[memory] {user_id} TODO 已创建")
+        return "todo created"
+
+    @filter.llm_tool()
+    async def complete_todo(self, event: AstrMessageEvent, item_index: int) -> str:
+        """将 TODO 中第 N 个未完成任务标记为已完成。
+
+        Args:
+            item_index(number): 未完成条目的序号，从 1 开始
+        """
+        user_id = event.get_sender_id()
+        path = _fpath(user_id, "todo.md")
+        raw = _read(path)
+        if not raw:
+            return "no todos found"
+        lines = raw.split("\n")
+        unchecked = [i for i, l in enumerate(lines) if l.strip().startswith("[ ]")]
+        target = int(item_index) - 1
+        if target < 0 or target >= len(unchecked):
+            return f"index {item_index} out of range"
+        lines[unchecked[target]] = lines[unchecked[target]].replace("[ ]", "[x]", 1)
+        _write(path, "\n".join(lines))
+        return f"todo item {item_index} completed"
+
+    @filter.llm_tool()
+    async def update_todo(self, event: AstrMessageEvent, items: str) -> str:
+        """覆盖更新整个 TODO 列表。
+
+        Args:
+            items(string): 完整的 TODO 条目内容，覆盖写入
+        """
+        user_id = event.get_sender_id()
+        _write(_fpath(user_id, "todo.md"), f"# TODO\n\n{items}\n")
+        return "todo updated"
+
+    @filter.llm_tool()
+    async def clear_todo(self, event: AstrMessageEvent) -> str:
+        """清空当前 TODO 列表。所有任务完成后调用。
+
+        Args:
+        """
+        user_id = event.get_sender_id()
+        _write(_fpath(user_id, "todo.md"), "# TODO\n\n")
+        return "todo cleared"
+
+    # ── 备忘录写入 Tools ──────────────────────────────────
+
+    @filter.llm_tool()
+    async def add_memo_block(self, event: AstrMessageEvent, blocks: list) -> str:
+        """在备忘录中批量新增 block，每个 block 内容自由组织。用户提到待办事项时调用。
+
+        Args:
+            blocks(array[string]): block 内容列表，每个元素是一段完整 Markdown 内容
+        """
+        user_id = event.get_sender_id()
+        _ensure_user(user_id)
+        path = _fpath(user_id, "memo.md")
+        existing = _read(path)
+        if not isinstance(blocks, list):
+            return "error: blocks must be a list"
+        clean_blocks = [b.strip("\n") for b in blocks if isinstance(b, str) and b.strip()]
+        if not clean_blocks:
+            return "error: no valid blocks provided"
+        base_ts = _gen_id()
+        next_seq = _next_memo_block_seq(existing, base_ts)
+        created_ids = []
+        entries = []
+        for i, c in enumerate(clean_blocks):
+            seq = next_seq + i
+            block_id = base_ts if seq == 0 else f"{base_ts}_{seq:03d}"
+            entries.append(f"<!-- block:{block_id} -->\n{c}\n<!-- /block -->")
+            created_ids.append(block_id)
+        _append(path, "\n\n" + "\n\n".join(entries) + "\n")
+        logger.info(f"[memory] {user_id} 备忘录批量新增 {len(created_ids)} 个 block：{created_ids}")
+        return f"added {len(created_ids)} memo blocks: {created_ids}"
+
+    @filter.llm_tool()
+    async def write_memo_block(self, event: AstrMessageEvent,
+                               block_id: str, content: str) -> str:
+        """按 block_id 覆盖写入某个备忘录 block 的内容，用于整理、合并或更新。部分修改时优先使用此工具而非删除。
+
+        Args:
+            block_id(string): 备忘录 block ID
+            content(string): 新的 block Markdown 内容，覆盖写入
+        """
+        user_id = event.get_sender_id()
+        path = _fpath(user_id, "memo.md")
+        raw = _read(path)
+        pattern = _memo_block_pattern(block_id)
+        new_block = f"<!-- block:{block_id} -->\n{content.strip()}\n<!-- /block -->"
+        new_raw, n = pattern.subn(new_block, raw, count=1)
+        if n == 0:
+            return f"block {block_id} not found"
+        _write(path, new_raw)
+        return f"memo block {block_id} updated"
+
+    @filter.llm_tool()
+    async def delete_memo_block(self, event: AstrMessageEvent, block_id: str) -> str:
+        """按 block_id 删除某个备忘录 block。仅在整个 block 的全部内容均已完成或作废时调用。若只需移除 block 内的部分内容，应使用 write_memo_block 覆盖写入。
+
+        Args:
+            block_id(string): 要删除的备忘录 block ID
+        """
+        user_id = event.get_sender_id()
+        path = _fpath(user_id, "memo.md")
+        raw = _read(path)
+        pattern = _memo_block_pattern(block_id)
+        new_raw, n = pattern.subn("", raw, count=1)
+        if n == 0:
+            return f"block {block_id} not found"
+        new_raw = re.sub(r'\n{3,}', '\n\n', new_raw).rstrip('\n') + '\n'
+        _write(path, new_raw)
+        return f"memo block {block_id} deleted"
 
     async def terminate(self):
         logger.info("[memory] 插件已卸载")
